@@ -3,6 +3,7 @@ package hscache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -14,28 +15,38 @@ const (
 	DefaultFetchCount = 100
 )
 
-type Cache interface {
+var (
+	ErrKeyExpired = errors.New("key expired")
+)
+
+type RedisCompatible interface {
+	HGet(ctx context.Context, name string, key string) *redis.StringCmd
+	HDel(ctx context.Context, key string, fields ...string) *redis.IntCmd
+	HSet(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
+	HScan(background context.Context, name string, cursor uint64, s string, count int64) *redis.ScanCmd
 }
 
 type Container struct {
-	ExpiresTS int64 `json:"expires_ts"`
-	Value     interface{}
+	ExpiresTS int64       `json:"expiresTs"`
+	Value     interface{} `json:"value"`
 }
 
 type HSCache struct {
-	client     *redis.Client
+	client     RedisCompatible
 	name       string
 	sleep      time.Duration
 	fetchCount int64
 }
 
 func (c *HSCache) Get(ctx context.Context, key string) (interface{}, error) {
+	var (
+		container Container
+	)
 	data, err := c.client.HGet(ctx, c.name, key).Result()
 	if err != nil {
 		return nil, err
 	}
 
-	container := Container{}
 	err = json.Unmarshal([]byte(data), &container)
 	if err != nil {
 		return nil, err
@@ -46,7 +57,7 @@ func (c *HSCache) Get(ctx context.Context, key string) (interface{}, error) {
 		if _, err := c.client.HDel(ctx, c.name, key).Result(); err != nil {
 			return nil, err
 		}
-		return nil, nil
+		return nil, ErrKeyExpired
 	}
 
 	return container.Value, nil
@@ -74,6 +85,9 @@ func (c *HSCache) SetFetchCount(count int64) {
 }
 
 func (c *HSCache) Evictor() {
+	var (
+		container Container
+	)
 	cursor := uint64(0)
 	for {
 		keys, newCursor, err := c.client.HScan(context.Background(), c.name, cursor, "*", c.fetchCount).Result()
@@ -91,7 +105,6 @@ func (c *HSCache) Evictor() {
 				continue
 			}
 
-			container := Container{}
 			err = json.Unmarshal([]byte(data), &container)
 			if err != nil {
 				continue
@@ -108,7 +121,7 @@ func (c *HSCache) Evictor() {
 	}
 }
 
-func New(client *redis.Client, name string) *HSCache {
+func New(client RedisCompatible, name string) *HSCache {
 	if name == "" {
 		name = DefaultName
 	}
